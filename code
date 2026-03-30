@@ -1,0 +1,763 @@
+<#
+.SYNOPSIS
+    FFlag Injector - A tool for modifying Roblox FastFlags
+.DESCRIPTION
+    This tool allows you to view, modify, and inject FastFlags into Roblox
+.NOTES
+    Requires administrator privileges
+    Use at your own risk
+#>
+
+# Ensure we're running as admin
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Start-Process powershell.exe "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    exit
+}
+
+# Set execution policy for this session
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
+# Add required assemblies
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Web.Extensions
+Add-Type -AssemblyName PresentationFramework
+
+# Add required Win32 API functions
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public class Win32 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int nSize, out int lpNumberOfBytesWritten);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+    
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool Module32FirstW(IntPtr hSnapshot, ref MODULEENTRY32 lpme);
+    
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool Module32NextW(IntPtr hSnapshot, ref MODULEENTRY32 lpme);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+    
+    [DllImport("user32.dll")]
+    public static extern int SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    
+    [DllImport("user32.dll")]
+    public static extern bool ReleaseCapture();
+    
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+    
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    public static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+    
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct MODULEENTRY32 {
+        public uint dwSize;
+        public uint th32ModuleID;
+        public uint th32ProcessID;
+        public uint GlblcntUsage;
+        public uint ProccntUsage;
+        public IntPtr modBaseAddr;
+        public uint modBaseSize;
+        public IntPtr hModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string szModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExePath;
+    }
+    
+    public const uint PROCESS_ALL_ACCESS = 0x001F0FFF;
+    public const uint TH32CS_SNAPMODULE = 0x00000008;
+    public const uint TH32CS_SNAPMODULE32 = 0x00000010;
+    public const uint STILL_ACTIVE = 259;
+    public const int WM_NCLBUTTONDOWN = 0xA1;
+    public const int HT_CAPTION = 0x2;
+}
+"@
+
+# Define theme colors
+$theme = @{
+    Background = [System.Drawing.Color]::FromArgb(30, 30, 46)
+    Surface = [System.Drawing.Color]::FromArgb(36, 36, 51)
+    Row2 = [System.Drawing.Color]::FromArgb(41, 41, 58)
+    Hover = [System.Drawing.Color]::FromArgb(69, 71, 90)
+    Border = [System.Drawing.Color]::FromArgb(88, 91, 112)
+    Foreground = [System.Drawing.Color]::FromArgb(205, 214, 244)
+    SubText = [System.Drawing.Color]::FromArgb(166, 173, 200)
+    Accent = [System.Drawing.Color]::FromArgb(137, 180, 250)
+    Green = [System.Drawing.Color]::FromArgb(166, 227, 161)
+    Red = [System.Drawing.Color]::FromArgb(243, 139, 168)
+    Peach = [System.Drawing.Color]::FromArgb(250, 179, 135)
+    Yellow = [System.Drawing.Color]::FromArgb(249, 226, 175)
+}
+
+# Application settings
+$appSettings = @{
+    AutoApply = $true
+    Watchdog = $true
+    AlwaysOnTop = $false
+    ConfirmApplyAll = $false
+    FirstMinimizeDone = $false
+    LastPreset = ""
+    SearchHistory = @()
+}
+
+# Application state
+$state = @{
+    Flags = @()
+    SelectedFlag = $null
+    ProcessId = 0
+    ProcessHandle = [IntPtr]::Zero
+    BaseAddress = [IntPtr]::Zero
+    ModuleSize = 0
+    OffsetMap = @{}
+    BankReady = $false
+    GameJoined = $false
+    FilterText = ""
+    FilterType = "All Types"
+    SortColumn = -1
+    SortAscending = $true
+    UndoStack = @()
+    RedoStack = @()
+    HighlightedFlags = @()
+}
+
+# Create application directory
+$appDir = Join-Path $env:APPDATA "FFlagInjector"
+$flagsPath = Join-Path $appDir "flags.json"
+$settingsPath = Join-Path $appDir "settings.json"
+$offsetCachePath = Join-Path $appDir "offset_cache.hpp"
+$logPath = Join-Path $appDir "log.txt"
+$presetsDir = Join-Path $appDir "presets"
+
+if (-not (Test-Path $appDir)) {
+    New-Item -ItemType Directory -Path $appDir -Force | Out-Null
+}
+
+if (-not (Test-Path $presetsDir)) {
+    New-Item -ItemType Directory -Path $presetsDir -Force | Out-Null
+}
+
+# Logger function
+function Write-Log {
+    param (
+        [string]$Level,
+        [string]$Message
+    )
+    
+    $timestamp = Get-Date -Format "HH:mm:ss.fff"
+    $logEntry = "$timestamp [$Level] $Message"
+    
+    try {
+        Add-Content -Path $logPath -Value $logEntry -ErrorAction SilentlyContinue
+        
+        # Also update the log in the UI if it exists
+        if ($script:logTextBox -ne $null) {
+            $script:logTextBox.Invoke([Action]{
+                $script:logTextBox.SelectionColor = switch ($Level) {
+                    "INFO" { $theme.Foreground }
+                    "WARN" { $theme.Yellow }
+                    "ERROR" { $theme.Red }
+                    "SUCCESS" { $theme.Green }
+                    default { $theme.SubText }
+                }
+                $script:logTextBox.AppendText("$timestamp [$Level] $Message`r`n")
+                $script:logTextBox.SelectionStart = $script:logTextBox.Text.Length
+                $script:logTextBox.ScrollToCaret()
+            })
+        }
+    } catch {
+        # Silent failure for logging
+    }
+}
+
+function log {
+    param (
+        [string]$HighlightMessage,
+        [string]$Message,
+        [string]$Sequence = '',
+        [System.ConsoleColor]$TimeColor = 'DarkGray',
+        [System.ConsoleColor]$HighlightColor = 'White',
+        [System.ConsoleColor]$MessageColor = 'White',
+        [System.ConsoleColor]$SequenceColor = 'White'
+    )
+    
+    $timestamp = "[{0:HH:mm:ss}]" -f (Get-Date)
+    
+    if ($script:logTextBox -ne $null) {
+        $script:logTextBox.Invoke([Action]{
+            # Time
+            $script:logTextBox.SelectionStart = $script:logTextBox.Text.Length
+            $script:logTextBox.SelectionColor = switch ($TimeColor) {
+                'DarkGray' { $theme.SubText }
+                default { $theme.SubText }
+            }
+            $script:logTextBox.AppendText("$timestamp ")
+            
+            # Highlight
+            $script:logTextBox.SelectionStart = $script:logTextBox.Text.Length
+            $script:logTextBox.SelectionColor = switch ($HighlightColor) {
+                'White' { $theme.Foreground }
+                'Gray' { $theme.SubText }
+                'Green' { $theme.Green }
+                'Red' { $theme.Red }
+                'Yellow' { $theme.Yellow }
+                default { $theme.Foreground }
+            }
+            $script:logTextBox.AppendText("$HighlightMessage ")
+            
+            # Message
+            $script:logTextBox.SelectionStart = $script:logTextBox.Text.Length
+            $script:logTextBox.SelectionColor = switch ($MessageColor) {
+                'White' { $theme.Foreground }
+                default { $theme.Foreground }
+            }
+            $script:logTextBox.AppendText("$Message ")
+            
+            # Sequence
+            $script:logTextBox.SelectionStart = $script:logTextBox.Text.Length
+            $script:logTextBox.SelectionColor = switch ($SequenceColor) {
+                'White' { $theme.Foreground }
+                default { $theme.Foreground }
+            }
+            $script:logTextBox.AppendText("$Sequence`r`n")
+            
+            $script:logTextBox.SelectionStart = $script:logTextBox.Text.Length
+            $script:logTextBox.ScrollToCaret()
+        })
+    }
+}
+
+# Load settings if they exist
+if (Test-Path $settingsPath) {
+    try {
+        $loadedSettings = Get-Content $settingsPath -Raw | ConvertFrom-Json
+        foreach ($key in $loadedSettings.PSObject.Properties.Name) {
+            if ($appSettings.ContainsKey($key)) {
+                $appSettings[$key] = $loadedSettings.$key
+            }
+        }
+        Write-Log -Level "INFO" -Message "Settings loaded"
+    } catch {
+        Write-Log -Level "ERROR" -Message "Failed to load settings: $_"
+    }
+}
+
+# Load flags if they exist
+if (Test-Path $flagsPath) {
+    try {
+        $loadedFlags = Get-Content $flagsPath -Raw | ConvertFrom-Json
+        $state.Flags = @($loadedFlags | ForEach-Object {
+            $flag = @{
+                Name = $_.Name
+                Value = $_.Value
+                Type = $_.Type
+                Enabled = $_.Enabled
+                Mode = $_.Mode
+                Status = ""
+                AddedAt = [DateTime]::UtcNow
+                History = @($_.History | ForEach-Object {
+                    @{
+                        Timestamp = $_.Timestamp
+                        OldValue = $_.OldValue
+                        NewValue = $_.NewValue
+                    }
+                })
+            }
+            $flag
+        })
+        Write-Log -Level "INFO" -Message "Loaded $($state.Flags.Count) flags"
+    } catch {
+        Write-Log -Level "ERROR" -Message "Failed to load flags: $_"
+    }
+}
+
+# Memory manipulation functions
+function Find-RobloxProcess {
+    $processes = Get-Process -Name "RobloxPlayerBeta" -ErrorAction SilentlyContinue
+    
+    if ($processes.Count -eq 0) {
+        return $null
+    }
+    
+    # Prefer processes with a window
+    $withWindow = $processes | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
+    if ($withWindow.Count -gt 0) {
+        return $withWindow[0]
+    }
+    
+    return $processes[0]
+}
+
+function Get-ModuleBase {
+    param (
+        [int]$ProcessId,
+        [string]$ModuleName
+    )
+    
+    try {
+        $snapshot = [Win32]::CreateToolhelp32Snapshot([Win32]::TH32CS_SNAPMODULE -bor [Win32]::TH32CS_SNAPMODULE32, $ProcessId)
+        if ($snapshot -eq [IntPtr]::Zero -or $snapshot -eq [IntPtr](-1)) {
+            return $null, 0
+        }
+        
+        $moduleEntry = New-Object Win32+MODULEENTRY32
+        $moduleEntry.dwSize = [System.Runtime.InteropServices.Marshal]::SizeOf($moduleEntry)
+        
+        if ([Win32]::Module32FirstW($snapshot, [ref]$moduleEntry)) {
+            do {
+                if ($moduleEntry.szModule -eq $ModuleName) {
+                    [Win32]::CloseHandle($snapshot)
+                    return $moduleEntry.modBaseAddr, $moduleEntry.modBaseSize
+                }
+            } while ([Win32]::Module32NextW($snapshot, [ref]$moduleEntry))
+        }
+        
+        [Win32]::CloseHandle($snapshot)
+    } catch {
+        Write-Log -Level "ERROR" -Message "Failed to get module base: $_"
+    }
+    
+    return $null, 0
+}
+
+function Attach-Process {
+    param (
+        [int]$ProcessId
+    )
+    
+    if ($state.ProcessHandle -ne [IntPtr]::Zero) {
+        [Win32]::CloseHandle($state.ProcessHandle)
+        $state.ProcessHandle = [IntPtr]::Zero
+        $state.BaseAddress = [IntPtr]::Zero
+        $state.ModuleSize = 0
+    }
+    
+    $handle = [Win32]::OpenProcess([Win32]::PROCESS_ALL_ACCESS, $false, $ProcessId)
+    if ($handle -eq [IntPtr]::Zero) {
+        Write-Log -Level "ERROR" -Message "Failed to open process: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        return $false
+    }
+    
+    $baseAddr, $size = Get-ModuleBase -ProcessId $ProcessId -ModuleName "RobloxPlayerBeta.exe"
+    if ($baseAddr -eq $null) {
+        [Win32]::CloseHandle($handle)
+        Write-Log -Level "ERROR" -Message "Failed to find module base"
+        return $false
+    }
+    
+    $state.ProcessHandle = $handle
+    $state.ProcessId = $ProcessId
+    $state.BaseAddress = $baseAddr
+    $state.ModuleSize = $size
+    
+    Write-Log -Level "INFO" -Message "Attached to process $ProcessId at base 0x$($baseAddr.ToString('X'))"
+    return $true
+}
+
+function Is-ProcessAlive {
+    if ($state.ProcessHandle -eq [IntPtr]::Zero) {
+        return $false
+    }
+    
+    $exitCode = 0
+    if (-not [Win32]::GetExitCodeProcess($state.ProcessHandle, [ref]$exitCode)) {
+        return $false
+    }
+    
+    return $exitCode -eq [Win32]::STILL_ACTIVE
+}
+
+function Read-ProcessMemory {
+    param (
+        [long]$Address,
+        [int]$Size
+    )
+    
+    if ($state.ProcessHandle -eq [IntPtr]::Zero) {
+        return $null
+    }
+    
+    $buffer = New-Object byte[] $Size
+    $bytesRead = 0
+    
+    if ([Win32]::ReadProcessMemory($state.ProcessHandle, [IntPtr]$Address, $buffer, $Size, [ref]$bytesRead) -and $bytesRead -eq $Size) {
+        return $buffer
+    }
+    
+    return $null
+}
+
+function Write-ProcessMemory {
+    param (
+        [long]$Address,
+        [byte[]]$Buffer
+    )
+    
+    if ($state.ProcessHandle -eq [IntPtr]::Zero) {
+        return $false
+    }
+    
+    $bytesWritten = 0
+    return [Win32]::WriteProcessMemory($state.ProcessHandle, [IntPtr]$Address, $Buffer, $Buffer.Length, [ref]$bytesWritten) -and $bytesWritten -eq $Buffer.Length
+}
+
+function Read-Int64 {
+    param (
+        [long]$Address
+    )
+    
+    $buffer = Read-ProcessMemory -Address $Address -Size 8
+    if ($buffer -eq $null) {
+        return 0
+    }
+    
+    return [BitConverter]::ToInt64($buffer, 0)
+}
+
+function Read-Int32 {
+    param (
+        [long]$Address
+    )
+    
+    $buffer = Read-ProcessMemory -Address $Address -Size 4
+    if ($buffer -eq $null) {
+        return 0
+    }
+    
+    return [BitConverter]::ToInt32($buffer, 0)
+}
+
+function Read-String {
+    param (
+        [long]$Address,
+        [int]$MaxLength = 256
+    )
+    
+    $buffer = Read-ProcessMemory -Address $Address -Size $MaxLength
+    if ($buffer -eq $null) {
+        return $null
+    }
+    
+    $nullTerminator = [Array]::IndexOf($buffer, [byte]0)
+    if ($nullTerminator -ge 0) {
+        $buffer = $buffer[0..($nullTerminator-1)]
+    }
+    
+    return [System.Text.Encoding]::UTF8.GetString($buffer)
+}
+
+# Flag type helpers
+function Get-FlagType {
+    param (
+        [string]$Name,
+        [string]$Value
+    )
+    
+    # First try to infer from name
+    foreach ($prefix in @("DFFlag", "SFFlag", "FFlag")) {
+        if ($Name.StartsWith($prefix) -and $Name.Length -gt $prefix.Length -and [char]::IsUpper($Name[$prefix.Length])) {
+            return "Bool"
+        }
+    }
+    
+    foreach ($prefix in @("DFInt", "SFInt", "FInt", "DFLog", "SFLog", "FLog")) {
+        if ($Name.StartsWith($prefix) -and $Name.Length -gt $prefix.Length -and [char]::IsUpper($Name[$prefix.Length])) {
+            return "Int"
+        }
+    }
+    
+    foreach ($prefix in @("DFString", "SFString", "FString")) {
+        if ($Name.StartsWith($prefix) -and $Name.Length -gt $prefix.Length -and [char]::IsUpper($Name[$prefix.Length])) {
+            return "String"
+        }
+    }
+    
+    # Then try to infer from value
+    if ($Value -eq "true" -or $Value -eq "false") {
+        return "Bool"
+    }
+    
+    if ($Value -match "^-?\d+$") {
+        return "Int"
+    }
+    
+    if ($Value -match "^-?\d+\.\d+$") {
+        return "Float"
+    }
+    
+    return "String"
+}
+
+function Get-FlagBytes {
+    param (
+        [hashtable]$Flag
+    )
+    
+    switch ($Flag.Type) {
+        "Bool" {
+            if ($Flag.Value -eq "true" -or $Flag.Value -eq "1") {
+                return [byte[]]@(1)
+            } else {
+                return [byte[]]@(0)
+            }
+        }
+        "Int" {
+            $value = 0
+            if ([int]::TryParse($Flag.Value, [ref]$value)) {
+                return [BitConverter]::GetBytes($value)
+            }
+            return [BitConverter]::GetBytes(0)
+        }
+        "Float" {
+            $value = 0.0
+            if ([float]::TryParse($Flag.Value, [ref]$value)) {
+                return [BitConverter]::GetBytes($value)
+            }
+            return [BitConverter]::GetBytes(0.0)
+        }
+        default {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Flag.Value)
+            $result = New-Object byte[] ($bytes.Length + 1)
+            [Array]::Copy($bytes, $result, $bytes.Length)
+            return $result
+        }
+    }
+}
+
+function Strip-FlagPrefix {
+    param (
+        [string]$Name
+    )
+    
+    $prefixes = @("DFString", "SFString", "FString", "DFFlag", "SFFlag", "DFInt", "SFInt", "DFLog", "SFLog", "FFlag", "FInt", "FLog")
+    
+    foreach ($prefix in $prefixes) {
+        if ($Name.Length -gt $prefix.Length -and $Name.StartsWith($prefix) -and [char]::IsUpper($Name[$prefix.Length])) {
+            return $Name.Substring($prefix.Length)
+        }
+    }
+    
+    return $Name
+}
+
+function Categorize-Flag {
+    param (
+        [string]$Name
+    )
+    
+    $stripped = Strip-FlagPrefix -Name $Name
+    
+    $categories = @{
+        "Rendering" = @("Render", "Graphics", "Shader", "Texture", "Light", "Shadow", "Material", "Mesh", "Particle", "PostEffect", "MSAA", "Antialias")
+        "Physics" = @("Physics", "Simulation", "Gravity", "Collision", "Velocity", "Force")
+        "Network" = @("Network", "Replicat", "Packet", "Latency", "Bandwidth", "Http", "Ping")
+        "UI" = @("Gui", "Ui", "Menu", "Hud", "Chat", "TextBox", "Button", "Frame", "Label", "Scroll", "TopBar", "StarterGui")
+        "Audio" = @("Audio", "Sound", "Music", "Volume")
+        "Performance" = @("Fps", "Perf", "Throttle", "Budget", "Cache", "Memory", "GC", "Pool", "Batch", "Queue", "Thread")
+        "Debug" = @("Debug", "Log", "Verbose", "Trace", "Assert", "Diag", "Telemetry", "Analytics", "Stat")
+        "Scripting" = @("Lua", "Script", "Module", "Require", "Bytecode", "VM")
+        "Camera" = @("Camera", "Zoom", "Fov", "ViewPort")
+        "Environment" = @("Terrain", "Water", "Sky", "Atmosphere", "Cloud", "Sun", "Moon", "Star")
+        "Character" = @("Anim", "IK", "Humanoid", "Character", "Avatar", "R15", "R6", "Emote")
+        "Engine" = @("Place", "Teleport", "Game", "Universe", "Server", "DataStore", "DataModel")
+    }
+    
+    foreach ($category in $categories.Keys) {
+        foreach ($keyword in $categories[$category]) {
+            if ($stripped -match $keyword) {
+                return $category
+            }
+        }
+    }
+    
+    return "Other"
+}
+
+# Fetch offsets from local files or create them if they don't exist
+function Fetch-Offsets {
+    $offsetData = @{}
+    $structOffsets = @{}
+    $flogPointer = 0
+    
+    # Try to load from local cache first
+    if (Test-Path $offsetCachePath) {
+        try {
+            $content = Get-Content $offsetCachePath -Raw
+            
+            # Parse FFlags namespace
+            if ($content -match "namespace\s+FFlags\s*\{([^}]+)\}") {
+                $flagsSection = $matches[1]
+                $pattern = "(?:inline\s+)?(?:constexpr\s+)?uintptr_t\s+(\w+)\s*=\s*(0x[0-9A-Fa-f]+);"
+                $flagsSection | Select-String -Pattern $pattern -AllMatches | ForEach-Object {
+                    foreach ($match in $_.Matches) {
+                        $name = $match.Groups[1].Value
+                        $value = [Convert]::ToInt64($match.Groups[2].Value, 16)
+                        if ($value -ge 0x100000) {
+                            $offsetData[$name] = $value
+                        }
+                    }
+                }
+            }
+            
+            # Parse FFlagList namespace for struct offsets
+            if ($content -match "namespace\s+FFlagList\s*\{([\s\S]*?)\}") {
+                $listSection = $matches[1]
+                $pattern = "(?:inline\s+)?(?:constexpr\s+)?uintptr_t\s+(\w+)\s*=\s*(0x[0-9A-Fa-f]+);"
+                $listSection | Select-String -Pattern $pattern -AllMatches | ForEach-Object {
+                    foreach ($match in $_.Matches) {
+                        $name = $match.Groups[1].Value
+                        $value = [Convert]::ToInt64($match.Groups[2].Value, 16)
+                        if ($name -eq "Pointer") {
+                            $flogPointer = $value
+                        }
+                        $structOffsets[$name] = $value
+                    }
+                }
+            }
+            
+            Write-Log -Level "INFO" -Message "Loaded $($offsetData.Count) offsets from cache"
+        } catch {
+            Write-Log -Level "ERROR" -Message "Failed to parse offset cache: $_"
+        }
+    }
+    
+    # If we couldn't load from cache, create some default values
+    # These are just examples and may need to be updated
+    if ($offsetData.Count -eq 0) {
+        $offsetData = @{
+            "DFIntTaskSchedulerTargetFps" = 0x7E70F48
+            "DFIntTaskSchedulerTargetFpsForUserPrivilege" = 0x7E70F88
+            "FFlagDebugForceFutureIsBrightPhase3" = 0x7E71088
+            "FFlagEnableInGameMenuV3" = 0x7E710C8
+            "FFlagDebugGraphicsDisableDirect3D11" = 0x7E71108
+            "FFlagDebugGraphicsPreferD3D11" = 0x7E71148
+            "FFlagDebugGraphicsPreferD3D11FL10" = 0x7E71188
+            "FFlagDebugGraphicsPreferOpenGL" = 0x7E711C8
+            "FFlagDebugGraphicsPreferVulkan" = 0x7E71208
+        }
+        
+        $structOffsets = @{
+            "Pointer" = 0x7e71128
+            "ToFlag" = 0x30
+            "ToValue" = 0xc0
+            "NodeForward" = 0x0
+            "NodeBackward" = 0x8
+            "NodePair" = 0x10
+            "Key" = 0x0
+            "Value" = 0x30
+            "Data" = 0x0
+            "Size" = 0x10
+            "Capacity" = 0x18
+            "FirstNode" = 0x0
+            "MapSize" = 0x20
+            "HashMapOff" = 0x8
+        }
+        
+        $flogPointer = $structOffsets["Pointer"]
+        
+        Write-Log -Level "INFO" -Message "Created default offsets"
+        
+        # Save to cache for future use
+        try {
+            $content = "namespace FFlags {`n"
+            foreach ($key in $offsetData.Keys) {
+                $content += "    constexpr uintptr_t $key = 0x$($offsetData[$key].ToString('X'));`n"
+            }
+            $content += "}`n`n"
+            
+            $content += "namespace FFlagList {`n"
+            foreach ($key in $structOffsets.Keys) {
+                $content += "    constexpr uintptr_t $key = 0x$($structOffsets[$key].ToString('X'));`n"
+            }
+            $content += "}`n"
+            
+            Set-Content -Path $offsetCachePath -Value $content
+            Write-Log -Level "INFO" -Message "Saved offsets to cache"
+        } catch {
+            Write-Log -Level "ERROR" -Message "Failed to save offset cache: $_"
+        }
+    }
+    
+    return $offsetData, $structOffsets, $flogPointer
+}
+
+# Initialize offsets
+$state.OffsetMap, $structOffsets, $flogPointer = Fetch-Offsets
+
+# Save flags to disk
+function Save-Flags {
+    try {
+        $jsonFlags = $state.Flags | ForEach-Object {
+            @{
+                Name = $_.Name
+                Value = $_.Value
+                Type = $_.Type
+                Enabled = $_.Enabled
+                Mode = $_.Mode
+                History = $_.History
+            }
+        }
+        
+        $jsonContent = ConvertTo-Json -InputObject $jsonFlags -Depth 4
+        Set-Content -Path $flagsPath -Value $jsonContent -Encoding UTF8
+        Write-Log -Level "INFO" -Message "Saved $($state.Flags.Count) flags"
+    } catch {
+        Write-Log -Level "ERROR" -Message "Failed to save flags: $_"
+    }
+}
+
+# Save settings to disk
+function Save-Settings {
+    try {
+        $jsonContent = ConvertTo-Json -InputObject $appSettings -Depth 2
+        Set-Content -Path $settingsPath -Value $jsonContent -Encoding UTF8
+        Write-Log -Level "INFO" -Message "Settings saved"
+    } catch {
+        Write-Log -Level "ERROR" -Message "Failed to save settings: $_"
+    }
+}
+
+# Apply a single flag
+function Apply-Flag {
+    param (
+        [hashtable]$Flag
+    )
+    
+    if ($state.ProcessHandle -eq [IntPtr]::Zero) {
+        return $false
+    }
+    
+    $address = 0
+    $method = ""
+    
+    # Try to find the flag address using offset map
+    $offset = $state.OffsetMap[$Flag.Name]
+    if ($offset -gt 0) {
+        $address = $state.BaseAddress.ToInt64() + $offset
+        $method = "offset"
+    }
+    
+    # If we couldn't find it in the offset map, try the FLog bank
+    # This is a simplified version - the full implementation would need to parse the FLog bank
+    
+    if ($address -eq 0) {
+        return $false
+    }
+    
+    
